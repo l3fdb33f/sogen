@@ -125,6 +125,7 @@ namespace sogen
     enum class callback_id : uint32_t
     {
         Invalid = 0,
+        NtUserGetThreadState,
         NtUserCreateWindowEx,
         NtUserDestroyWindow,
         NtUserShowWindow,
@@ -132,36 +133,22 @@ namespace sogen
         NtUserEnumDisplayMonitors,
     };
 
-    enum class wow64_callback_postprocess : uint8_t
-    {
-        none = 0,
-        bool_result_to_status = 1,
-    };
-
-    struct pending_wow64_callback
-    {
-        uint32_t callback_id{};
-        wow64_callback_postprocess postprocess{wow64_callback_postprocess::none};
-
-        void serialize(utils::buffer_serializer& buffer) const
-        {
-            buffer.write(this->callback_id);
-            buffer.write(static_cast<uint8_t>(this->postprocess));
-        }
-
-        void deserialize(utils::buffer_deserializer& buffer)
-        {
-            buffer.read(this->callback_id);
-            this->postprocess = static_cast<wow64_callback_postprocess>(buffer.read<uint8_t>());
-        }
-    };
-
     struct callback_frame
     {
         callback_id handler_id{};
         uint64_t rip{};
+        uint64_t rbp{};
+        uint64_t rdi{};
+        uint64_t rsi{};
         uint64_t rsp{};
         uint64_t r10{};
+        uint64_t r11{};
+        uint64_t r12{};
+        uint64_t r13{};
+        uint64_t r14{};
+        uint64_t r15{};
+        uint64_t rax{};
+        uint64_t rbx{};
         uint64_t rcx{};
         uint64_t rdx{};
         uint64_t r8{};
@@ -190,6 +177,17 @@ namespace sogen
 
         void serialize(utils::buffer_serializer& buffer) const;
         void deserialize(utils::buffer_deserializer& buffer);
+    };
+
+    class emulator_process : public ref_counted_object
+    {
+        void serialize_object(utils::buffer_serializer&) const override
+        {
+        }
+
+        void deserialize_object(utils::buffer_deserializer&) override
+        {
+        }
     };
 
     class emulator_thread : public ref_counted_object
@@ -256,9 +254,8 @@ namespace sogen
         std::optional<NTSTATUS> pending_status{};
 
         uint64_t win32k_thread_info{0};
+        uint64_t win32k_thread_state{0};
         handle win32k_desktop{};
-        uint64_t win32k_callback_buffer{0};
-        std::optional<pending_wow64_callback> win32k_pending_wow64_callback{};
         bool win32k_thread_setup_pending{false};
         bool win32k_thread_setup_done{false};
 
@@ -286,7 +283,13 @@ namespace sogen
             return this->await_time.has_value() && this->await_time.value() != infinite && this->await_time.value() < clock.steady_now();
         }
 
-        std::optional<msg> peek_pending_message(hwnd hwnd_filter, UINT filter_min, UINT filter_max, bool remove = false);
+        bool has_pending_alertable_apc() const
+        {
+            return this->apc_alertable && !this->pending_apcs.empty();
+        }
+
+        std::optional<msg> peek_pending_message(const process_context& process, hwnd hwnd_filter, UINT filter_min, UINT filter_max,
+                                                bool remove = false);
         void post_message(const msg& msg);
 
         bool is_terminated() const;
@@ -358,9 +361,8 @@ namespace sogen
 
             buffer.write_optional(this->pending_status);
             buffer.write(this->win32k_thread_info);
+            buffer.write(this->win32k_thread_state);
             buffer.write(this->win32k_desktop);
-            buffer.write(this->win32k_callback_buffer);
-            buffer.write_optional(this->win32k_pending_wow64_callback);
             buffer.write(this->win32k_thread_setup_pending);
             buffer.write(this->win32k_thread_setup_done);
             buffer.write_optional(this->gs_segment);
@@ -420,9 +422,8 @@ namespace sogen
 
             buffer.read_optional(this->pending_status);
             buffer.read(this->win32k_thread_info);
+            buffer.read(this->win32k_thread_state);
             buffer.read(this->win32k_desktop);
-            buffer.read(this->win32k_callback_buffer);
-            buffer.read_optional(this->win32k_pending_wow64_callback, [] { return pending_wow64_callback{}; });
             buffer.read(this->win32k_thread_setup_pending);
             buffer.read(this->win32k_thread_setup_done);
             buffer.read_optional(this->gs_segment, [this] { return emulator_allocator(*this->memory_ptr); });

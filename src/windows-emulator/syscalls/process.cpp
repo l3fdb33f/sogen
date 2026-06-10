@@ -13,7 +13,7 @@ namespace sogen
                                                   const uint64_t process_information, const uint32_t process_information_length,
                                                   const emulator_object<uint32_t> return_length)
         {
-            if (process_handle != CURRENT_PROCESS)
+            if (!c.proc.is_current_process_handle(process_handle))
             {
                 return STATUS_NOT_SUPPORTED;
             }
@@ -123,6 +123,11 @@ namespace sogen
                                                                 c.Foreground = 1;
                                                                 c.PriorityClass = 32; // Normal
                                                             });
+
+            case ProcessWow64Information:
+                return handle_query<EmulatorTraits<Emu64>::ULONG_PTR>(
+                    c.emu, process_information, process_information_length, return_length,
+                    [&](EmulatorTraits<Emu64>::ULONG_PTR& peb32) { peb32 = c.proc.peb32 ? c.proc.peb32->value() : 0; });
 
             case ProcessBasicInformation: {
                 const auto init_basic_info = [&](PROCESS_BASIC_INFORMATION64& basic_info) {
@@ -246,7 +251,7 @@ namespace sogen
         NTSTATUS handle_NtSetInformationProcess(const syscall_context& c, const handle process_handle, const uint32_t info_class,
                                                 const uint64_t process_information, const uint32_t process_information_length)
         {
-            if (process_handle != CURRENT_PROCESS)
+            if (!c.proc.is_current_process_handle(process_handle))
             {
                 return STATUS_NOT_SUPPORTED;
             }
@@ -434,10 +439,10 @@ namespace sogen
             return STATUS_NOT_SUPPORTED;
         }
 
-        NTSTATUS handle_NtOpenProcessToken(const syscall_context&, const handle process_handle, const ACCESS_MASK /*desired_access*/,
+        NTSTATUS handle_NtOpenProcessToken(const syscall_context& c, const handle process_handle, const ACCESS_MASK /*desired_access*/,
                                            const emulator_object<handle> token_handle)
         {
-            if (process_handle != CURRENT_PROCESS)
+            if (!c.proc.is_current_process_handle(process_handle))
             {
                 return STATUS_NOT_SUPPORTED;
             }
@@ -461,14 +466,14 @@ namespace sogen
                 {
                     if (&thread != c.proc.active_thread)
                     {
-                        thread.exit_status = exit_status;
+                        c.proc.terminate_thread(thread, exit_status);
                     }
                 }
 
                 return STATUS_SUCCESS;
             }
 
-            if (process_handle == CURRENT_PROCESS)
+            if (c.proc.is_current_process_handle(process_handle))
             {
                 c.proc.exit_status = exit_status;
                 c.emu.stop();

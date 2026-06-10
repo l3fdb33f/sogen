@@ -8,6 +8,15 @@ option(SOGEN_ENABLE_CLANG_TIDY "Enable clang-tidy checks" OFF)
 option(SOGEN_ENABLE_LTO "Enable interprocedural optimization (LTO/IPO)" ON)
 option(SOGEN_ENABLE_RUST_CODE "Enable code parts written in rust" ON)
 option(SOGEN_ENABLE_REFLECTION "Enable reflection using the reflect library" ON)
+# SDL3 provides the host UI backend on every non-Emscripten platform, so it is
+# required and enabled by default everywhere. Emscripten uses the web UI backend
+# instead and skips SDL in deps/CMakeLists.txt. project() runs after this block,
+# so EMSCRIPTEN is not known yet and cannot be branched on here.
+option(SOGEN_ENABLE_SDL3 "Enable SDL3 dependency and backend scaffolding when submodule exists" ON)
+# When ON, a system-installed SDL3 (find_package, e.g. libsdl3-dev on Ubuntu 25.04+,
+# Homebrew, vcpkg) is used if present, falling back to the vendored deps/SDL submodule.
+# Set OFF to always build the pinned submodule.
+option(SOGEN_USE_SYSTEM_SDL3 "Prefer a system-installed SDL3 over the vendored deps/SDL submodule" ON)
 option(SOGEN_EMSCRIPTEN_MEMORY64 "Enable memory 64 support for emscripten builds" OFF)
 option(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS "Enable Node.js filesystem for emscripten compilation" OFF)
 
@@ -54,14 +63,14 @@ endif()
 
 ##########################################
 
-if(SKBUILD)
+if(SKBUILD OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   set(SOGEN_BUILD_STATIC_DEFAULT ON)
 else()
   set(SOGEN_BUILD_STATIC_DEFAULT ${SOGEN_IS_SUBPROJECT})
 endif()
 option(SOGEN_BUILD_STATIC "Build sogen as static libraries for embedding (e.g., IDA plugins)" ${SOGEN_BUILD_STATIC_DEFAULT})
 option(SOGEN_DISABLE_NANOBIND_LEAK_WARNINGS "Disable nanobind leak warnings in the Python module" OFF)
-if (SOGEN_IS_SUBPROJECT OR SKBUILD)
+if(SOGEN_IS_SUBPROJECT OR SKBUILD)
   set(SOGEN_BUILD_TOOLS_DEFAULT OFF)
 else()
   set(SOGEN_BUILD_TOOLS_DEFAULT ON)

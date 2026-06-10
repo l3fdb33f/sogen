@@ -66,7 +66,7 @@ namespace sogen
 
         std::vector<uint8_t> get_sid(registry_manager& registry)
         {
-            const auto sid_string = get_user_sid_string(registry);
+            const auto sid_string = registry_utils::get_user_sid_string(registry);
             return sid_string_to_bytes(sid_string);
         }
 
@@ -185,25 +185,13 @@ namespace sogen
                 for (size_t i = 0; const auto value_opt = registry.get_value(*env_key, i); i++)
                 {
                     const auto& value = *value_opt;
-
-                    if (value.type != REG_SZ && value.type != REG_EXPAND_SZ)
+                    const auto decoded = registry_utils::decode_registry_string(value);
+                    if (!decoded)
                     {
                         continue;
                     }
 
-                    if (value.data.empty() || value.data.size() % 2 != 0)
-                    {
-                        continue;
-                    }
-
-                    const auto char_count = value.data.size() / sizeof(char16_t);
-                    const auto* data_ptr = reinterpret_cast<const char16_t*>(value.data.data());
-                    if (data_ptr[char_count - 1] != u'\0')
-                    {
-                        continue;
-                    }
-
-                    const auto [it, inserted] = env_map.emplace(u8_to_u16(value.name), std::u16string(data_ptr, char_count - 1));
+                    const auto [it, inserted] = env_map.emplace(u8_to_u16(value.name), *decoded);
                     if (inserted && value.type == REG_EXPAND_SZ)
                     {
                         keys_to_expand.insert(it->first);
@@ -234,14 +222,15 @@ namespace sogen
             }
             system_temp += u"SystemTemp";
 
-            env_map[u"COMPUTERNAME"] = u"momo";
-            env_map[u"USERNAME"] = u"momo";
+            const auto user_profile = registry_utils::get_user_profile_path(registry);
+            env_map[u"COMPUTERNAME"] = registry_utils::get_account_domain(registry);
+            env_map[u"USERNAME"] = registry_utils::get_user_name(registry);
             env_map[u"SystemDrive"] = system_drive;
             env_map[u"SystemRoot"] = system_root;
             env_map[u"SystemTemp"] = system_temp;
-            env_map[u"TMP"] = u"C:\\Users\\momo\\AppData\\Temp";
-            env_map[u"TEMP"] = u"C:\\Users\\momo\\AppData\\Temp";
-            env_map[u"USERPROFILE"] = u"C:\\Users\\momo";
+            env_map[u"TMP"] = user_profile + u"\\AppData\\Temp";
+            env_map[u"TEMP"] = user_profile + u"\\AppData\\Temp";
+            env_map[u"USERPROFILE"] = user_profile;
 
             for (const auto& [key, value] : app_settings.environment)
             {
@@ -334,7 +323,14 @@ namespace sogen
             for (const auto& arg : app_settings.arguments)
             {
                 command_line.push_back(u' ');
-                command_line.append(arg);
+                if (arg.find(' ') != std::string::npos)
+                {
+                    command_line.append(u"\"" + arg + u"\"");
+                }
+                else
+                {
+                    command_line.append(arg);
+                }
             }
 
             allocator.make_unicode_string(proc_params.CommandLine, command_line);
@@ -484,10 +480,14 @@ namespace sogen
         this->rtl_user_thread_start = ntdll.find_export("RtlUserThreadStart");
         this->ki_user_apc_dispatcher = ntdll.find_export("KiUserApcDispatcher");
         this->ki_user_exception_dispatcher = ntdll.find_export("KiUserExceptionDispatcher");
+        this->ki_user_callback_dispatcher = ntdll.find_export("KiUserCallbackDispatcher");
         this->instrumentation_callback = 0;
-        this->wow64_ki_user_callback_dispatcher = 0;
         this->zw_callback_return = ntdll.find_export("ZwCallbackReturn");
         this->gdi_default_dc_handle = 0;
+        this->gdi_dc_states.clear();
+        this->gdi_dc_save_states.clear();
+        this->gdi_bitmap_surfaces.clear();
+        this->gdi_window_surfaces.clear();
         this->etw_notification_event.reset();
 
         const auto gdi_shared_table = this->base_allocator.reserve<GDI_SHARED_MEMORY64>();
@@ -540,10 +540,14 @@ namespace sogen
         this->default_desktop_window_handle = wh;
         desktop_win.handle = wh.bits;
         desktop_win.style = WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
+        desktop_win.width = 1920;
+        desktop_win.height = 1080;
         desktop_win.guest.access([&](USER_WINDOW& window) {
             window.hWnd = wh.bits;
             window.ptrBase = desktop_win.guest.value();
             window.dwStyle = desktop_win.style;
+            window.rcWindow = {.left = 0, .top = 0, .right = desktop_win.width, .bottom = desktop_win.height};
+            window.rcClient = window.rcWindow;
             window.fnid = 0x29D;   // FNID_DESKTOP
             window.windowBand = 1; // ZBID_DESKTOP
         });
@@ -577,12 +581,17 @@ namespace sogen
         buffer.write_optional(this->rtl_user_thread_start32);
         buffer.write(this->ki_user_apc_dispatcher);
         buffer.write(this->ki_user_exception_dispatcher);
+        buffer.write(this->ki_user_callback_dispatcher);
         buffer.write(this->instrumentation_callback);
-        buffer.write(this->wow64_ki_user_callback_dispatcher);
         buffer.write(this->zw_callback_return);
         buffer.write(this->dispatch_client_message);
         buffer.write(this->gdi_default_dc_handle);
+        buffer.write_map(this->gdi_dc_states);
+        buffer.write_map(this->gdi_dc_save_states);
+        buffer.write_map(this->gdi_bitmap_surfaces);
+        buffer.write_map(this->gdi_window_surfaces);
         buffer.write_optional(this->etw_notification_event);
+        buffer.write(this->mouse_capture_window);
 
         buffer.write(this->user_handles);
         buffer.write(this->default_monitor_handle);
@@ -644,12 +653,17 @@ namespace sogen
         buffer.read_optional(this->rtl_user_thread_start32);
         buffer.read(this->ki_user_apc_dispatcher);
         buffer.read(this->ki_user_exception_dispatcher);
+        buffer.read(this->ki_user_callback_dispatcher);
         buffer.read(this->instrumentation_callback);
-        buffer.read(this->wow64_ki_user_callback_dispatcher);
         buffer.read(this->zw_callback_return);
         buffer.read(this->dispatch_client_message);
         buffer.read(this->gdi_default_dc_handle);
+        buffer.read_map(this->gdi_dc_states);
+        buffer.read_map(this->gdi_dc_save_states);
+        buffer.read_map(this->gdi_bitmap_surfaces);
+        buffer.read_map(this->gdi_window_surfaces);
         buffer.read_optional(this->etw_notification_event);
+        buffer.read(this->mouse_capture_window);
 
         buffer.read(this->user_handles);
         buffer.read(this->default_monitor_handle);
@@ -699,6 +713,10 @@ namespace sogen
     {
         switch (handle.value.type)
         {
+        case handle_types::process: {
+            static dummy_handle_store<handle_types::process, emulator_process> handle_store{GUEST_PROCESS_HANDLE};
+            return &handle_store;
+        }
         case handle_types::thread:
             return &threads;
         case handle_types::event:
@@ -734,6 +752,39 @@ namespace sogen
         }
     }
 
+    // NOLINTNEXTLINE(cert-dcl50-cpp,readability-convert-member-functions-to-static)
+    bool process_context::is_current_process_handle(const handle handle) const
+    {
+        return handle == CURRENT_PROCESS || handle == GUEST_PROCESS_HANDLE;
+    }
+
+    bool process_context::is_current_thread_handle(const handle handle) const
+    {
+        return handle == CURRENT_THREAD || (handle.value.type == handle_types::thread && this->active_thread &&
+                                            this->threads.find_handle(this->active_thread) == handle);
+    }
+
+    // NOLINTNEXTLINE(cert-dcl50-cpp,readability-convert-member-functions-to-static)
+    bool process_context::is_object_pseudo_handle(const handle handle) const
+    {
+        return handle == CURRENT_PROCESS || handle == CURRENT_THREAD;
+    }
+
+    handle process_context::resolve_object_pseudo_handle(const handle handle) const
+    {
+        if (handle == CURRENT_PROCESS)
+        {
+            return GUEST_PROCESS_HANDLE;
+        }
+
+        if (handle == CURRENT_THREAD)
+        {
+            return this->threads.find_handle(this->active_thread);
+        }
+
+        return handle;
+    }
+
     size_t process_context::get_live_thread_count() const
     {
         return std::count_if(threads.begin(), threads.end(), [](auto& item) { return !item.second.is_terminated(); });
@@ -746,6 +797,31 @@ namespace sogen
         auto [h, thr] = this->threads.store_and_get(std::move(t));
         this->callbacks_->on_thread_create(h, *thr);
         return h;
+    }
+
+    void process_context::terminate_thread(emulator_thread& thread, const NTSTATUS thread_exit_status)
+    {
+        thread.exit_status = thread_exit_status;
+
+        for (auto& mutant : this->mutants | std::views::values)
+        {
+            if (mutant.owning_thread_id == thread.id && mutant.locked_count > 0)
+            {
+                mutant.abandon();
+            }
+        }
+
+        for (auto i = this->windows.begin(); i != this->windows.end();)
+        {
+            if (i->second.thread_id != thread.id)
+            {
+                ++i;
+                continue;
+            }
+
+            i->second.ref_count = 1;
+            i = this->windows.erase(i).first;
+        }
     }
 
     std::optional<uint16_t> process_context::find_atom(const std::u16string_view name)

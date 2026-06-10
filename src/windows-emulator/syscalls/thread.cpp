@@ -9,66 +9,6 @@
 namespace sogen
 {
 
-    namespace
-    {
-        struct wow64_callback_context
-        {
-            std::array<std::byte, 0x108> reserved0{};
-            uint64_t output_pointer{};
-            uint32_t output_length{};
-            uint32_t status{};
-            std::array<std::byte, 0x28> reserved1{};
-        };
-        static_assert(offsetof(wow64_callback_context, output_pointer) == 0x108);
-        static_assert(offsetof(wow64_callback_context, output_length) == 0x110);
-        static_assert(offsetof(wow64_callback_context, status) == 0x114);
-        static_assert(sizeof(wow64_callback_context) == 0x140);
-
-        void apply_pending_wow64_callback_postprocess(const syscall_context& c)
-        {
-            auto* thread = c.proc.active_thread;
-            if (!thread || !thread->win32k_pending_wow64_callback.has_value())
-            {
-                return;
-            }
-
-            const auto postprocess = thread->win32k_pending_wow64_callback->postprocess;
-            thread->win32k_pending_wow64_callback.reset();
-
-            if (postprocess != wow64_callback_postprocess::bool_result_to_status)
-            {
-                return;
-            }
-
-            if (thread->win32k_callback_buffer == 0)
-            {
-                return;
-            }
-
-            wow64_callback_context callback_context{};
-            if (!c.win_emu.memory.try_read_memory(thread->win32k_callback_buffer, &callback_context, sizeof(callback_context)))
-            {
-                return;
-            }
-
-            if (!NT_SUCCESS(static_cast<NTSTATUS>(callback_context.status)) || callback_context.output_pointer == 0 ||
-                callback_context.output_length < sizeof(uint32_t))
-            {
-                return;
-            }
-
-            uint32_t callback_result{};
-            if (!c.win_emu.memory.try_read_memory(callback_context.output_pointer, &callback_result, sizeof(callback_result)))
-            {
-                return;
-            }
-
-            callback_context.status = callback_result;
-            c.win_emu.memory.try_write_memory(thread->win32k_callback_buffer + offsetof(wow64_callback_context, status),
-                                              &callback_context.status, sizeof(callback_context.status));
-        }
-    }
-
     namespace syscalls
     {
         NTSTATUS handle_NtSetInformationThread(const syscall_context& c, const handle thread_handle, const THREADINFOCLASS info_class,
@@ -107,7 +47,59 @@ namespace sogen
                 // Update the persistent context for future queries
                 thread->wow64_cpu_reserved->access([&](WOW64_CPURESERVED& ctx) {
                     ctx.Flags |= WOW64_CPURESERVED_FLAG_RESET_STATE;
-                    ctx.Context = new_wow64_context;
+                    auto merged_context = ctx.Context;
+                    merged_context.ContextFlags = new_wow64_context.ContextFlags;
+
+                    if ((new_wow64_context.ContextFlags & CONTEXT_DEBUG_REGISTERS_32) == CONTEXT_DEBUG_REGISTERS_32)
+                    {
+                        merged_context.Dr0 = new_wow64_context.Dr0;
+                        merged_context.Dr1 = new_wow64_context.Dr1;
+                        merged_context.Dr2 = new_wow64_context.Dr2;
+                        merged_context.Dr3 = new_wow64_context.Dr3;
+                        merged_context.Dr6 = new_wow64_context.Dr6;
+                        merged_context.Dr7 = new_wow64_context.Dr7;
+                    }
+
+                    if ((new_wow64_context.ContextFlags & CONTEXT_FLOATING_POINT_32) == CONTEXT_FLOATING_POINT_32)
+                    {
+                        merged_context.FloatSave = new_wow64_context.FloatSave;
+                    }
+
+                    if ((new_wow64_context.ContextFlags & CONTEXT_SEGMENTS_32) == CONTEXT_SEGMENTS_32)
+                    {
+                        merged_context.SegGs = new_wow64_context.SegGs;
+                        merged_context.SegFs = new_wow64_context.SegFs;
+                        merged_context.SegEs = new_wow64_context.SegEs;
+                        merged_context.SegDs = new_wow64_context.SegDs;
+                    }
+
+                    if ((new_wow64_context.ContextFlags & CONTEXT_INTEGER_32) == CONTEXT_INTEGER_32)
+                    {
+                        merged_context.Edi = new_wow64_context.Edi;
+                        merged_context.Esi = new_wow64_context.Esi;
+                        merged_context.Ebx = new_wow64_context.Ebx;
+                        merged_context.Edx = new_wow64_context.Edx;
+                        merged_context.Ecx = new_wow64_context.Ecx;
+                        merged_context.Eax = new_wow64_context.Eax;
+                    }
+
+                    if ((new_wow64_context.ContextFlags & CONTEXT_CONTROL_32) == CONTEXT_CONTROL_32)
+                    {
+                        merged_context.Ebp = new_wow64_context.Ebp;
+                        merged_context.Eip = new_wow64_context.Eip;
+                        merged_context.SegCs = new_wow64_context.SegCs;
+                        merged_context.EFlags = new_wow64_context.EFlags;
+                        merged_context.Esp = new_wow64_context.Esp;
+                        merged_context.SegSs = new_wow64_context.SegSs;
+                    }
+
+                    if ((new_wow64_context.ContextFlags & CONTEXT_EXTENDED_REGISTERS_32) == CONTEXT_EXTENDED_REGISTERS_32)
+                    {
+                        memcpy(merged_context.ExtendedRegisters, new_wow64_context.ExtendedRegisters,
+                               sizeof(merged_context.ExtendedRegisters));
+                    }
+
+                    ctx.Context = merged_context;
                     // c.win_emu.callbacks.on_suspicious_activity("WOW64 CONTEXT");
                 });
 
@@ -474,10 +466,10 @@ namespace sogen
             return STATUS_INVALID_CID;
         }
 
-        NTSTATUS handle_NtOpenThreadToken(const syscall_context&, const handle thread_handle, const ACCESS_MASK /*desired_access*/,
+        NTSTATUS handle_NtOpenThreadToken(const syscall_context& c, const handle thread_handle, const ACCESS_MASK /*desired_access*/,
                                           const BOOLEAN /*open_as_self*/, const emulator_object<handle> token_handle)
         {
-            if (thread_handle != CURRENT_THREAD)
+            if (!c.proc.is_current_thread_handle(thread_handle))
             {
                 return STATUS_NOT_SUPPORTED;
             }
@@ -494,21 +486,6 @@ namespace sogen
             return handle_NtOpenThreadToken(c, thread_handle, desired_access, open_as_self, token_handle);
         }
 
-        static void delete_thread_windows(const syscall_context& c, const uint32_t thread_id)
-        {
-            for (auto i = c.proc.windows.begin(); i != c.proc.windows.end();)
-            {
-                if (i->second.thread_id != thread_id)
-                {
-                    ++i;
-                    continue;
-                }
-
-                i->second.ref_count = 1;
-                i = c.proc.windows.erase(i).first;
-            }
-        }
-
         NTSTATUS handle_NtTerminateThread(const syscall_context& c, const handle thread_handle, const NTSTATUS exit_status)
         {
             auto* thread = !thread_handle.bits ? c.proc.active_thread : c.proc.threads.get(thread_handle);
@@ -518,10 +495,8 @@ namespace sogen
                 return STATUS_INVALID_HANDLE;
             }
 
-            thread->exit_status = exit_status;
+            c.proc.terminate_thread(*thread, exit_status);
             c.win_emu.callbacks.on_thread_terminated(thread_handle, *thread);
-
-            delete_thread_windows(c, thread->id);
 
             if (thread == c.proc.active_thread)
             {
@@ -665,7 +640,6 @@ namespace sogen
                 argument = c.emu.read_memory<KCONTINUE_ARGUMENT>(continue_argument);
             }
 
-            apply_pending_wow64_callback_postprocess(c);
             const auto context = thread_context.read();
             cpu_context::restore(c.emu, context);
 
@@ -686,12 +660,14 @@ namespace sogen
                                         const ACCESS_MASK /*desired_access*/, const ULONG /*handle_attributes*/, const ULONG flags,
                                         const emulator_object<handle> new_thread_handle)
         {
-            if (process_handle != CURRENT_PROCESS)
+            if (!c.proc.is_current_process_handle(process_handle))
             {
                 return STATUS_INVALID_HANDLE;
             }
 
-            if (thread_handle != NULL_HANDLE && thread_handle.value.type != handle_types::thread)
+            const auto resolved_thread_handle = c.proc.resolve_object_pseudo_handle(thread_handle);
+
+            if (resolved_thread_handle != NULL_HANDLE && resolved_thread_handle.value.type != handle_types::thread)
             {
                 return STATUS_INVALID_HANDLE;
             }
@@ -703,7 +679,7 @@ namespace sogen
                 return STATUS_NOT_SUPPORTED;
             }
 
-            bool return_next_thread = thread_handle == NULL_HANDLE;
+            bool return_next_thread = resolved_thread_handle == NULL_HANDLE;
             for (auto& t : c.proc.threads)
             {
                 if (return_next_thread && !t.second.is_terminated())
@@ -713,7 +689,7 @@ namespace sogen
                     return STATUS_SUCCESS;
                 }
 
-                if (t.first == thread_handle.value.id)
+                if (t.first == resolved_thread_handle.value.id)
                 {
                     return_next_thread = true;
                 }
@@ -797,7 +773,7 @@ namespace sogen
                                          const EmulatorTraits<Emu64>::SIZE_T maximum_stack_size,
                                          const emulator_object<PS_ATTRIBUTE_LIST<EmulatorTraits<Emu64>>> attribute_list)
         {
-            if (process_handle != CURRENT_PROCESS)
+            if (!c.proc.is_current_process_handle(process_handle))
             {
                 return STATUS_NOT_SUPPORTED;
             }
@@ -861,7 +837,7 @@ namespace sogen
             {
                 attributes.access(
                     [&](const PS_ATTRIBUTE<EmulatorTraits<Emu64>>& attribute) {
-                        const auto type = attribute.Attribute & ~PS_ATTRIBUTE_THREAD;
+                        const auto type = attribute.Attribute & PS_ATTRIBUTE_NUMBER_MASK;
 
                         if (type == PsAttributeClientId)
                         {
@@ -871,6 +847,10 @@ namespace sogen
                         else if (type == PsAttributeTebAddress)
                         {
                             write_attribute(c.emu, attribute, thread->teb64->value());
+                        }
+                        else if (type == PsAttributeGroupAffinity || type == PsAttributeIdealProcessor)
+                        {
+                            // Scheduling hints; not modeled by the emulator.
                         }
                         else
                         {

@@ -83,6 +83,51 @@ namespace sogen
         }
     };
 
+    struct gdi_bitmap_surface
+    {
+        uint32_t width{};
+        uint32_t height{};
+        std::vector<uint32_t> pixels{};
+
+        void serialize(utils::buffer_serializer& buffer) const
+        {
+            buffer.write(this->width);
+            buffer.write(this->height);
+            buffer.write_vector(this->pixels);
+        }
+
+        void deserialize(utils::buffer_deserializer& buffer)
+        {
+            buffer.read(this->width);
+            buffer.read(this->height);
+            buffer.read_vector(this->pixels);
+        }
+    };
+
+    struct gdi_dc_state
+    {
+        uint32_t selected_bitmap{};
+        hwnd target_window{};
+        int32_t current_x{};
+        int32_t current_y{};
+
+        void serialize(utils::buffer_serializer& buffer) const
+        {
+            buffer.write(this->selected_bitmap);
+            buffer.write(this->target_window);
+            buffer.write(this->current_x);
+            buffer.write(this->current_y);
+        }
+
+        void deserialize(utils::buffer_deserializer& buffer)
+        {
+            buffer.read(this->selected_bitmap);
+            buffer.read(this->target_window);
+            buffer.read(this->current_x);
+            buffer.read(this->current_y);
+        }
+    };
+
     struct process_context
     {
         struct callbacks
@@ -145,6 +190,7 @@ namespace sogen
 
         handle create_thread(memory_manager& memory, uint64_t start_address, uint64_t argument, uint64_t stack_size, uint32_t create_flags,
                              bool initial_thread = false);
+        void terminate_thread(emulator_thread& thread, NTSTATUS thread_exit_status);
 
         std::optional<uint16_t> find_atom(std::u16string_view name);
         uint16_t add_or_find_atom(std::u16string name);
@@ -164,6 +210,10 @@ namespace sogen
         void deserialize(utils::buffer_deserializer& buffer);
 
         generic_handle_store* get_handle_store(handle handle);
+        bool is_current_process_handle(handle handle) const;
+        bool is_current_thread_handle(handle handle) const;
+        bool is_object_pseudo_handle(handle handle) const;
+        handle resolve_object_pseudo_handle(handle handle) const;
 
         size_t get_live_thread_count() const;
 
@@ -192,12 +242,19 @@ namespace sogen
         uint64_t rtl_user_thread_start{};
         uint64_t ki_user_apc_dispatcher{};
         uint64_t ki_user_exception_dispatcher{};
+        uint64_t ki_user_callback_dispatcher{};
         uint64_t instrumentation_callback{};
-        uint64_t wow64_ki_user_callback_dispatcher{};
         uint64_t zw_callback_return{};
         uint64_t dispatch_client_message{};
         uint32_t gdi_default_dc_handle{};
+        std::map<uint32_t, gdi_dc_state> gdi_dc_states{};
+        // Per-DC stack of states pushed by NtGdiSaveDC and popped by NtGdiRestoreDC.
+        std::map<uint32_t, std::vector<gdi_dc_state>> gdi_dc_save_states{};
+        std::map<uint32_t, gdi_bitmap_surface> gdi_bitmap_surfaces{};
+        // Persistent per-top-level-window paint surface; child controls composite into it at their offset.
+        std::map<uint32_t, gdi_bitmap_surface> gdi_window_surfaces{};
         std::optional<handle> etw_notification_event{};
+        hwnd mouse_capture_window{};
 
         // For WOW64 processes
         std::optional<emulator_object<PEB32>> peb32;

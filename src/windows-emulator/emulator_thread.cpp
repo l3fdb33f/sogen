@@ -11,6 +11,13 @@ namespace sogen
 
     namespace
     {
+        enum class wait_state
+        {
+            not_signaled,
+            signaled,
+            abandoned,
+        };
+
         void setup_wow64_fs_segment(memory_manager& memory, uint64_t teb32_addr)
         {
             const uint64_t base = teb32_addr;
@@ -62,7 +69,7 @@ namespace sogen
             }
         }
 
-        bool is_object_signaled(process_context& c, const handle h, const uint32_t current_thread_id)
+        wait_state observe_object_signal(process_context& c, const handle h, const uint32_t current_thread_id)
         {
             const auto type = h.value.type;
 
@@ -71,35 +78,48 @@ namespace sogen
             default:
                 break;
 
+            case handle_types::process:
+                if (h == GUEST_PROCESS_HANDLE && c.exit_status.has_value())
+                {
+                    return wait_state::signaled;
+                }
+
+                break;
+
             case handle_types::event: {
                 if (h.value.is_pseudo)
                 {
-                    return true;
+                    return wait_state::signaled;
                 }
 
-                auto* e = c.events.get(h);
-                if (e)
+                const auto* e = c.events.get(h);
+                if (e && e->signaled)
                 {
-                    return e->is_signaled();
+                    return wait_state::signaled;
                 }
 
                 break;
             }
 
             case handle_types::mutant: {
-                auto* e = c.mutants.get(h);
-                return !e || e->try_lock(current_thread_id);
+                const auto* e = c.mutants.get(h);
+                if (e && e->is_signaled(current_thread_id))
+                {
+                    return e->abandoned ? wait_state::abandoned : wait_state::signaled;
+                }
+
+                break;
             }
 
             case handle_types::timer: {
-                return true; // TODO
+                return wait_state::signaled; // TODO
             }
 
             case handle_types::semaphore: {
-                auto* s = c.semaphores.get(h);
-                if (s)
+                const auto* s = c.semaphores.get(h);
+                if (s && s->current_count > 0)
                 {
-                    return s->try_lock();
+                    return wait_state::signaled;
                 }
 
                 break;
@@ -107,16 +127,93 @@ namespace sogen
 
             case handle_types::thread: {
                 const auto* t = c.threads.get(h);
-                if (t)
+                if (t && t->is_terminated())
                 {
-                    return t->is_terminated();
+                    return wait_state::signaled;
                 }
 
                 break;
             }
             }
 
-            throw std::runtime_error("Bad object: " + std::to_string(h.value.type));
+            return wait_state::not_signaled;
+        }
+
+        std::optional<wait_state> consume_object_signal(process_context& c, const handle h, const uint32_t current_thread_id)
+        {
+            switch (h.value.type)
+            {
+            case handle_types::process: {
+                if (h != GUEST_PROCESS_HANDLE || !c.exit_status.has_value())
+                {
+                    return std::nullopt;
+                }
+
+                return wait_state::signaled;
+            }
+
+            case handle_types::event: {
+                if (h.value.is_pseudo)
+                {
+                    return wait_state::signaled;
+                }
+
+                auto* event = c.events.get(h);
+                if (!event || !event->signaled)
+                {
+                    return std::nullopt;
+                }
+
+                if (event->type == SynchronizationEvent)
+                {
+                    event->signaled = false;
+                }
+
+                return wait_state::signaled;
+            }
+
+            case handle_types::mutant: {
+                auto* mutant = c.mutants.get(h);
+                if (!mutant)
+                {
+                    return std::nullopt;
+                }
+
+                const auto acquired = mutant->try_lock(current_thread_id);
+                if (!acquired.has_value())
+                {
+                    return std::nullopt;
+                }
+
+                return *acquired ? wait_state::abandoned : wait_state::signaled;
+            }
+
+            case handle_types::timer:
+                return wait_state::signaled; // TODO
+
+            case handle_types::semaphore: {
+                auto* semaphore = c.semaphores.get(h);
+                if (!semaphore || !semaphore->try_lock())
+                {
+                    return std::nullopt;
+                }
+
+                return wait_state::signaled;
+            }
+
+            case handle_types::thread: {
+                const auto* thread = c.threads.get(h);
+                if (!thread || !thread->is_terminated())
+                {
+                    return std::nullopt;
+                }
+
+                return wait_state::signaled;
+            }
+
+            default:
+                throw std::runtime_error("Bad object: " + std::to_string(h.value.type));
+            }
         }
     }
 
@@ -392,16 +489,46 @@ namespace sogen
         this->waiting_for_alert = false;
     }
 
-    std::optional<msg> emulator_thread::peek_pending_message(hwnd hwnd_filter, UINT filter_min, UINT filter_max, bool remove)
+    namespace
+    {
+        // GetMessage(hWnd) retrieves messages for hWnd and all of its children (IsChild semantics),
+        // so a message targeted at a child control must match a filter naming any of its ancestors.
+        bool window_matches_filter(const process_context& process, const hwnd target, const hwnd filter)
+        {
+            auto current = target;
+            while (current != 0)
+            {
+                if (current == filter)
+                {
+                    return true;
+                }
+
+                const auto* win = process.windows.get(current);
+                if (!win)
+                {
+                    break;
+                }
+
+                current = win->parent_handle;
+            }
+
+            return false;
+        }
+    }
+
+    std::optional<msg> emulator_thread::peek_pending_message(const process_context& process, hwnd hwnd_filter, UINT filter_min,
+                                                             UINT filter_max, bool remove)
     {
         for (auto it = message_queue.begin(); it != message_queue.end(); ++it)
         {
-            if (hwnd_filter != 0 && hwnd_filter != static_cast<hwnd>(-1) && it->window != hwnd_filter)
+            if (hwnd_filter == static_cast<hwnd>(-1))
             {
-                continue;
+                if (it->window != 0)
+                {
+                    continue;
+                }
             }
-
-            if (hwnd_filter == static_cast<hwnd>(-1) && it->window != 0)
+            else if (hwnd_filter != 0 && !window_matches_filter(process, it->window, hwnd_filter))
             {
                 continue;
             }
@@ -457,27 +584,49 @@ namespace sogen
         if (!this->await_objects.empty())
         {
             bool all_signaled = true;
+            std::optional<uint32_t> abandoned_index{};
             for (uint32_t i = 0; i < this->await_objects.size(); ++i)
             {
                 const auto& obj = this->await_objects[i];
 
-                const auto signaled = is_object_signaled(process, obj, this->id);
+                const auto state = observe_object_signal(process, obj, this->id);
+                const auto signaled = state != wait_state::not_signaled;
                 all_signaled &= signaled;
+
+                if (state == wait_state::abandoned && !abandoned_index.has_value())
+                {
+                    abandoned_index = i;
+                }
 
                 if (signaled && this->await_any)
                 {
-                    this->mark_as_ready(STATUS_WAIT_0 + i);
+                    const auto consumed_state = consume_object_signal(process, obj, this->id);
+                    if (!consumed_state.has_value())
+                    {
+                        throw std::runtime_error("Failed to consume object signal!");
+                    }
+
+                    this->mark_as_ready(*consumed_state == wait_state::abandoned ? (STATUS_ABANDONED_WAIT_0 + i) : (STATUS_WAIT_0 + i));
                     return true;
                 }
             }
 
             if (!this->await_any && all_signaled)
             {
-                this->mark_as_ready(STATUS_SUCCESS);
+                for (const auto& obj : this->await_objects)
+                {
+                    const auto consumed_state = consume_object_signal(process, obj, this->id);
+                    if (!consumed_state.has_value())
+                    {
+                        throw std::runtime_error("Failed to consume object signal!");
+                    }
+                }
+
+                this->mark_as_ready(abandoned_index.has_value() ? (STATUS_ABANDONED_WAIT_0 + *abandoned_index) : STATUS_SUCCESS);
                 return true;
             }
 
-            if (this->is_await_time_over(clock))
+            if (this->is_await_time_over(clock) && !this->has_pending_alertable_apc())
             {
                 this->mark_as_ready(STATUS_TIMEOUT);
                 return true;
@@ -488,7 +637,7 @@ namespace sogen
 
         if (this->await_time.has_value())
         {
-            if (this->is_await_time_over(clock))
+            if (this->is_await_time_over(clock) && !this->has_pending_alertable_apc())
             {
                 this->mark_as_ready(STATUS_SUCCESS);
                 return true;
@@ -525,7 +674,7 @@ namespace sogen
                     return true;
                 }
 
-                if (timeout_expired(wait))
+                if (timeout_expired(wait) && !this->has_pending_alertable_apc())
                 {
                     this->mark_as_ready(STATUS_TIMEOUT);
                     return true;
@@ -548,7 +697,7 @@ namespace sogen
                     return true;
                 }
 
-                if (timeout_expired(wait))
+                if (timeout_expired(wait) && !this->has_pending_alertable_apc())
                 {
                     emulator_object<ULONG>{*this->memory_ptr, wait.entries_removed_ptr}.write_if_valid(0);
                     this->mark_as_ready(STATUS_TIMEOUT);
@@ -564,10 +713,48 @@ namespace sogen
 
         if (this->await_msg.has_value())
         {
-            if (const auto m = this->peek_pending_message(this->await_msg->hwnd_filter, this->await_msg->filter_min,
+            if (const auto m = this->peek_pending_message(process, this->await_msg->hwnd_filter, this->await_msg->filter_min,
                                                           this->await_msg->filter_max, true))
             {
                 this->await_msg->message.write(*m);
+
+                uint64_t active_handle = 0;
+                uint64_t active_window_ptr = 0;
+                if (const auto* win = process.windows.get(m->window))
+                {
+                    active_handle = win->handle;
+                    active_window_ptr = win->guest.value();
+                }
+
+                if (this->teb64)
+                {
+                    this->teb64->access([&](TEB64& teb) {
+                        teb.Win32ClientInfo.arr[8] = active_handle;
+                        teb.Win32ClientInfo.arr[9] = active_window_ptr;
+                    });
+                }
+
+                if (process.is_wow64_process && this->teb32)
+                {
+                    uint32_t active_handle32 = 0;
+                    uint32_t active_window_ptr32 = 0;
+
+                    if (active_handle <= std::numeric_limits<uint32_t>::max())
+                    {
+                        active_handle32 = static_cast<uint32_t>(active_handle);
+                    }
+
+                    if (active_window_ptr <= std::numeric_limits<uint32_t>::max())
+                    {
+                        active_window_ptr32 = static_cast<uint32_t>(active_window_ptr);
+                    }
+
+                    this->teb32->access([&](TEB32& teb) {
+                        teb.Win32ClientInfo[8] = active_handle32;
+                        teb.Win32ClientInfo[9] = active_window_ptr32;
+                    });
+                }
+
                 this->mark_as_ready(m->message != WM_QUIT ? TRUE : FALSE);
                 return true;
             }
@@ -662,8 +849,18 @@ namespace sogen
         }
 
         this->rip = emu.reg(x86_register::rip);
+        this->rbp = emu.reg(x86_register::rbp);
+        this->rdi = emu.reg(x86_register::rdi);
+        this->rsi = emu.reg(x86_register::rsi);
         this->rsp = emu.reg(x86_register::rsp);
         this->r10 = emu.reg(x86_register::r10);
+        this->r11 = emu.reg(x86_register::r11);
+        this->r12 = emu.reg(x86_register::r12);
+        this->r13 = emu.reg(x86_register::r13);
+        this->r14 = emu.reg(x86_register::r14);
+        this->r15 = emu.reg(x86_register::r15);
+        this->rax = emu.reg(x86_register::rax);
+        this->rbx = emu.reg(x86_register::rbx);
         this->rcx = emu.reg(x86_register::rcx);
         this->rdx = emu.reg(x86_register::rdx);
         this->r8 = emu.reg(x86_register::r8);
@@ -690,8 +887,18 @@ namespace sogen
         emu.reg<uint16_t>(x86_register::fs, this->fs);
         emu.reg<uint16_t>(x86_register::gs, this->gs);
         emu.reg(x86_register::rip, this->rip);
+        emu.reg(x86_register::rbp, this->rbp);
+        emu.reg(x86_register::rdi, this->rdi);
+        emu.reg(x86_register::rsi, this->rsi);
         emu.reg(x86_register::rsp, this->rsp);
         emu.reg(x86_register::r10, this->r10);
+        emu.reg(x86_register::r11, this->r11);
+        emu.reg(x86_register::r12, this->r12);
+        emu.reg(x86_register::r13, this->r13);
+        emu.reg(x86_register::r14, this->r14);
+        emu.reg(x86_register::r15, this->r15);
+        emu.reg(x86_register::rax, this->rax);
+        emu.reg(x86_register::rbx, this->rbx);
         emu.reg(x86_register::rcx, this->rcx);
         emu.reg(x86_register::rdx, this->rdx);
         emu.reg(x86_register::r8, this->r8);
@@ -702,8 +909,18 @@ namespace sogen
     {
         buffer.write(this->handler_id);
         buffer.write(this->rip);
+        buffer.write(this->rbp);
+        buffer.write(this->rdi);
+        buffer.write(this->rsi);
         buffer.write(this->rsp);
         buffer.write(this->r10);
+        buffer.write(this->r11);
+        buffer.write(this->r12);
+        buffer.write(this->r13);
+        buffer.write(this->r14);
+        buffer.write(this->r15);
+        buffer.write(this->rax);
+        buffer.write(this->rbx);
         buffer.write(this->rcx);
         buffer.write(this->rdx);
         buffer.write(this->r8);
@@ -726,8 +943,18 @@ namespace sogen
     {
         buffer.read(this->handler_id);
         buffer.read(this->rip);
+        buffer.read(this->rbp);
+        buffer.read(this->rdi);
+        buffer.read(this->rsi);
         buffer.read(this->rsp);
         buffer.read(this->r10);
+        buffer.read(this->r11);
+        buffer.read(this->r12);
+        buffer.read(this->r13);
+        buffer.read(this->r14);
+        buffer.read(this->r15);
+        buffer.read(this->rax);
+        buffer.read(this->rbx);
         buffer.read(this->rcx);
         buffer.read(this->rdx);
         buffer.read(this->r8);

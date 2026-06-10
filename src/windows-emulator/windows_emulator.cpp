@@ -10,6 +10,7 @@
 
 #include "exception_dispatch.hpp"
 #include "apiset/apiset.hpp"
+#include "syscall_dispatcher.hpp"
 
 #include "network/static_socket_factory.hpp"
 #include "memory_permission_ext.hpp"
@@ -50,6 +51,138 @@ namespace sogen
         {
             adjust_working_directory(app_settings);
             adjust_application(app_settings);
+        }
+
+        int16_t point_x(const uint64_t lparam)
+        {
+            return static_cast<int16_t>(lparam & 0xFFFF);
+        }
+
+        int16_t point_y(const uint64_t lparam)
+        {
+            return static_cast<int16_t>((lparam >> 16) & 0xFFFF);
+        }
+
+        struct child_hit_test_result
+        {
+            const window* win{};
+            int x{};
+            int y{};
+        };
+
+        std::optional<child_hit_test_result> find_child_window_at(const process_context& process, const hwnd parent, const int x,
+                                                                  const int y)
+        {
+            std::optional<child_hit_test_result> result{};
+            for (const auto& [index, child] : process.windows)
+            {
+                (void)index;
+                if (child.parent_handle != parent || (child.style & WS_VISIBLE) == 0 || (child.style & WS_DISABLED) != 0)
+                {
+                    continue;
+                }
+
+                if (x >= child.x && x < child.x + child.width && y >= child.y && y < child.y + child.height)
+                {
+                    const auto child_x = x - child.x;
+                    const auto child_y = y - child.y;
+                    if (auto descendant = find_child_window_at(process, child.handle, child_x, child_y))
+                    {
+                        result = descendant;
+                    }
+                    else
+                    {
+                        result = child_hit_test_result{.win = &child, .x = child_x, .y = child_y};
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        std::optional<POINT> get_window_origin_relative_to_ancestor(const process_context& process, const hwnd window, const hwnd ancestor)
+        {
+            POINT origin{};
+            auto current_handle = window;
+            while (current_handle != 0 && current_handle != ancestor)
+            {
+                const auto* current = process.windows.get(current_handle);
+                if (!current)
+                {
+                    return std::nullopt;
+                }
+
+                origin.x += current->x;
+                origin.y += current->y;
+                current_handle = current->parent_handle;
+            }
+
+            if (current_handle != ancestor)
+            {
+                return std::nullopt;
+            }
+
+            return origin;
+        }
+
+        bool is_pointer_message(const uint32_t message)
+        {
+            // All mouse messages go through capture/child hit-testing: while a window holds the mouse
+            // capture every mouse message must reach it (so a pressed button still completes its click),
+            // and otherwise each is delivered to the child under the cursor (hover, right-click, etc.).
+            return message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN || message == WM_LBUTTONUP || message == WM_RBUTTONDOWN ||
+                   message == WM_RBUTTONUP;
+        }
+
+        uint64_t pack_point(const int x, const int y)
+        {
+            return static_cast<uint16_t>(x) | (static_cast<uint64_t>(static_cast<uint16_t>(y)) << 16);
+        }
+
+        struct pointer_target
+        {
+            hwnd window{};
+            int x{};
+            int y{};
+        };
+
+        // Single authority for routing a top-level-local pointer event to its destination window.
+        // Backends only forward (top-level window, top-level-local x/y); capture and child hit-testing
+        // are decided here, never in the host backends.
+        pointer_target route_pointer(process_context& process, const hwnd top_level, const int x, const int y)
+        {
+            if (process.mouse_capture_window != 0)
+            {
+                if (const auto* captured = process.windows.get(process.mouse_capture_window);
+                    captured && (captured->style & WS_VISIBLE) != 0)
+                {
+                    // Capture sends every pointer event to the capturing window, even one reported for
+                    // another top-level. Translate via screen coordinates (origin relative to the root)
+                    // so it works across top-levels; for a child of top_level this is the same offset.
+                    const auto captured_origin = get_window_origin_relative_to_ancestor(process, captured->handle, 0);
+                    const auto top_level_origin = get_window_origin_relative_to_ancestor(process, top_level, 0);
+                    if (captured_origin && top_level_origin)
+                    {
+                        const auto screen_x = top_level_origin->x + x;
+                        const auto screen_y = top_level_origin->y + y;
+                        return {.window = captured->handle, .x = screen_x - captured_origin->x, .y = screen_y - captured_origin->y};
+                    }
+                }
+                else
+                {
+                    process.mouse_capture_window = 0;
+                }
+
+                return {.window = top_level, .x = x, .y = y};
+            }
+
+            // Otherwise deliver to the deepest visible/enabled child under the cursor.
+            if (const auto child = find_child_window_at(process, top_level, x, y))
+            {
+                return {.window = child->win->handle, .x = child->x, .y = child->y};
+            }
+
+            return {.window = top_level, .x = x, .y = y};
         }
 
         void perform_context_switch_work(windows_emulator& win_emu)
@@ -301,6 +434,16 @@ namespace sogen
             return std::make_unique<network::socket_factory>();
 #endif
         }
+
+        std::unique_ptr<ui_backend> get_ui_backend(emulator_interfaces& interfaces)
+        {
+            if (interfaces.ui)
+            {
+                return std::move(interfaces.ui);
+            }
+
+            return create_default_ui_backend();
+        }
     }
 
     windows_emulator::windows_emulator(std::unique_ptr<x86_64_emulator> emu, application_settings app_settings,
@@ -317,6 +460,7 @@ namespace sogen
           clock_(get_clock(interfaces, this->executed_instructions_, settings.use_relative_time)),
           dns_lookup_(get_dns_lookup(interfaces)),
           socket_factory_(get_socket_factory(interfaces)),
+          ui_backend_(get_ui_backend(interfaces)),
           emulation_root{settings.emulation_root.empty() ? settings.emulation_root : absolute(settings.emulation_root)},
           fake_env(settings.fake_env),
           callbacks(std::move(callbacks)),
@@ -327,6 +471,7 @@ namespace sogen
           process(*this->emu_, memory, *this->clock_, this->callbacks),
           use_relative_time_(settings.use_relative_time)
     {
+        this->ui_backend_->set_event_sink([this](const ui_event& event) { this->handle_ui_event(event); });
 #ifndef OS_WINDOWS
         if (this->emulation_root.empty())
         {
@@ -405,6 +550,8 @@ namespace sogen
         this->switch_thread_ = false;
         while (!switch_to_next_thread(*this))
         {
+            this->ui_backend_->pump_events();
+
             if (this->use_relative_time_)
             {
                 this->executed_instructions_ += MAX_INSTRUCTIONS_PER_TIME_SLICE;
@@ -581,16 +728,14 @@ namespace sogen
 
         this->callbacks.on_module_unload.add([this](mapped_module& mod) {
             const auto hooks = this->section_first_execution_hooks_.extract(mod.image_base);
-            if (!hooks)
+            if (hooks)
             {
-                return;
-            }
-
-            for (auto* hook : hooks.mapped())
-            {
-                if (hook)
+                for (auto* hook : hooks.mapped())
                 {
-                    this->emu().delete_hook(hook);
+                    if (hook)
+                    {
+                        this->emu().delete_hook(hook);
+                    }
                 }
             }
         });
@@ -664,7 +809,25 @@ namespace sogen
                 return;
             case 45:
                 this->callbacks.on_suspicious_activity("DbgPrint");
-                dispatch_breakpoint(*this);
+                {
+                    const auto cs_selector = this->emu().reg<uint16_t>(x86_register::cs);
+                    const auto bitness = segment_utils::get_segment_bitness(this->emu(), cs_selector);
+                    const auto service = this->emu().reg<uint32_t>(x86_register::eax);
+
+                    if (bitness && *bitness == segment_utils::segment_bitness::bit64 &&
+                        (service == BREAKPOINT_PRINT || service == BREAKPOINT_LOAD_SYMBOLS || service == BREAKPOINT_UNLOAD_SYMBOLS ||
+                         service == BREAKPOINT_COMMAND_STRING))
+                    {
+                        const auto ip = this->emu().supports_instruction_counting() //
+                                            ? this->current_thread().current_ip
+                                            : this->emu().read_instruction_pointer();
+                        this->emu().reg(x86_register::rip, ip + 3);
+                    }
+                    else
+                    {
+                        dispatch_breakpoint(*this);
+                    }
+                }
                 return;
             default:
                 if (this->callbacks.on_generic_activity)
@@ -761,6 +924,7 @@ namespace sogen
 
         while (!this->should_stop)
         {
+            this->ui_backend_->pump_events();
             if (this->switch_thread_ || !this->current_thread().is_thread_ready(this->process, this->clock()))
             {
                 if (!this->perform_thread_switch())
@@ -787,6 +951,43 @@ namespace sogen
 
                 count = static_cast<size_t>(target_instructions - current_instructions);
             }
+        }
+    }
+
+    void windows_emulator::handle_ui_event(const ui_event& event)
+    {
+        const auto* win = this->process.windows.get(event.window);
+        if (!win)
+        {
+            return;
+        }
+
+        auto* thread = get_thread_by_id(this->process, win->thread_id);
+        if (!thread)
+        {
+            return;
+        }
+
+        msg m{};
+        m.window = event.window;
+        m.message = event.message;
+        m.wParam = event.wParam;
+        m.lParam = event.lParam;
+
+        if (is_pointer_message(event.message))
+        {
+            const auto target = route_pointer(this->process, event.window, point_x(event.lParam), point_y(event.lParam));
+            m.window = target.window;
+            m.lParam = pack_point(target.x, target.y);
+        }
+
+        thread->post_message(m);
+
+        if (event.message == WM_CLOSE || event.message == WM_COMMAND || event.message == WM_KEYDOWN || event.message == WM_LBUTTONDOWN ||
+            event.message == WM_LBUTTONUP)
+        {
+            this->switch_thread_ = true;
+            this->emu().stop();
         }
     }
 

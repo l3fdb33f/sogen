@@ -8,6 +8,24 @@
 #define FNID_START      0x29A
 #define FNID_ARRAY_SIZE 24
 
+#define FNID_SCROLLBAR  0x29A
+#define FNID_ICONTITLE  0x29B
+#define FNID_MENU       0x29C
+#define FNID_DESKTOP    0x29D
+#define FNID_DEFWINDOW  0x29E
+#define FNID_MESSAGE    0x29F
+#define FNID_SWITCH     0x2A0
+#define FNID_BUTTON     0x2A1
+#define FNID_COMBOBOX   0x2A2
+#define FNID_COMBOLBOX  0x2A3
+#define FNID_DIALOG     0x2A4
+#define FNID_EDIT       0x2A5
+#define FNID_LISTBOX    0x2A6
+#define FNID_MDICLIENT  0x2A7
+#define FNID_STATIC     0x2A8
+#define FNID_IME        0x2A9
+#define FNID_GHOST      0x2AA
+
 namespace sogen
 {
 
@@ -25,12 +43,18 @@ namespace sogen
         uint64_t apfnClientWorker[FNID_ARRAY_SIZE];
         uint8_t unknown2[0xE90];
         uint64_t ahbrSystem[USER_SERVERINFO_BRUSH_SLOT_COUNT];
-        uint8_t unknown3[USER_SERVERINFO_BRUSH_TRAILING_BYTES];
+        uint8_t unknown3a[0x34];
+        int32_t defaultFontHeightScale;
+        int32_t defaultFontWidthScale;
+        uint8_t unknown3b[0x7C2];
+        uint16_t systemDpi;
     };
     static_assert(offsetof(USER_SERVERINFO, apfnClientA) == 0x188);
     static_assert(offsetof(USER_SERVERINFO, ahbrSystem) == 0x1258);
-    static_assert(offsetof(USER_SERVERINFO, unknown3) == 0x1358);
-    static_assert(sizeof(USER_SERVERINFO) == 0x13D0);
+    static_assert(offsetof(USER_SERVERINFO, defaultFontHeightScale) == 0x138C);
+    static_assert(offsetof(USER_SERVERINFO, defaultFontWidthScale) == 0x1390);
+    static_assert(offsetof(USER_SERVERINFO, systemDpi) == 0x1B56);
+    static_assert(sizeof(USER_SERVERINFO) == 0x1B58);
 
     struct USER_DISPINFO
     {
@@ -55,9 +79,22 @@ namespace sogen
         EMULATOR_CAST(uint64_t, USER_SERVERINFO*) psi;
         EMULATOR_CAST(uint64_t, USER_HANDLEENTRY*) aheList;
         uint32_t HeEntrySize;
+        uint32_t pad_014;
         EMULATOR_CAST(uint64_t, USER_DISPINFO*) pDispInfo;
-        uint8_t unknown[0xFF];
+        uint8_t pad_020[0x78];
+        uint32_t controlMessageMax;
+        uint32_t pad_09C;
+        uint64_t controlMessageBits;
+        uint8_t pad_0A8[0x60];
+        uint32_t staticMessageMax;
+        uint32_t pad_10C;
+        uint64_t staticMessageBits;
     };
+    static_assert(offsetof(USER_SHAREDINFO, pDispInfo) == 0x18);
+    static_assert(offsetof(USER_SHAREDINFO, controlMessageMax) == 0x98);
+    static_assert(offsetof(USER_SHAREDINFO, controlMessageBits) == 0xA0);
+    static_assert(offsetof(USER_SHAREDINFO, staticMessageMax) == 0x108);
+    static_assert(offsetof(USER_SHAREDINFO, staticMessageBits) == 0x110);
 
     // user32 reads fields after copying 0x238 payload to _gSharedInfo
     struct WIN32K_USERCONNECT32
@@ -174,9 +211,12 @@ namespace sogen
         uint16_t fnid;
         uint8_t pad_02C[4];
         uint64_t spwndParent;
-        uint8_t pad_038[8];
+        uint64_t spwndChild;
         uint64_t spwndOwner;
-        uint8_t pad_048[48];
+        uint64_t spwndNext;
+        uint64_t spwndPrev;
+        RECT rcWindow;
+        RECT rcClient;
         uint64_t lpfnWndProc;
         uint64_t pcls;
         uint8_t pad_088[16];

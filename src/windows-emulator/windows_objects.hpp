@@ -3,6 +3,7 @@
 #include "handles.hpp"
 
 #include <algorithm>
+#include <string_view>
 #include <serialization_helper.hpp>
 #include <utils/file_handle.hpp>
 #include <platform/synchronisation.hpp>
@@ -31,18 +32,6 @@ namespace sogen
         bool signaled{};
         EVENT_TYPE type{};
         std::u16string name{};
-
-        bool is_signaled()
-        {
-            const auto res = this->signaled;
-
-            if (this->type == SynchronizationEvent)
-            {
-                this->signaled = false;
-            }
-
-            return res;
-        }
 
         void serialize_object(utils::buffer_serializer& buffer) const override
         {
@@ -81,6 +70,12 @@ namespace sogen
         }
     };
 
+    // WC_DIALOG = MAKEINTATOM(0x8002); user32 creates dialogs and message boxes with this fixed
+    // system atom, which the kernel reports as the class name "#32770". The atom value is constant
+    // across Windows builds (unlike the builtin control-class atoms, which vary per build and are
+    // resolved through SERVERINFO.atomSysClass), so matching this canonical name is portable.
+    inline constexpr std::u16string_view builtin_dialog_class_name = u"#32770";
+
     struct window : user_object<USER_WINDOW>
     {
         uint32_t thread_id{};
@@ -95,12 +90,24 @@ namespace sogen
         int32_t y{};
         uint32_t ex_style{};
         uint32_t style{};
+        RECT update_rect{};
+        bool update_pending{};
+        bool paint_message_posted{};
+        bool erase_pending{};
         std::map<std::u16string, uint64_t> props{};
         emulator_pointer wnd_proc{};
+        emulator_pointer system_menu_ptr{};
+        bool host_surface_window{};
+        bool unicode_proc{};
 
         window(memory_interface& memory)
             : user_object(memory)
         {
+        }
+
+        bool is_dialog() const
+        {
+            return this->class_name == builtin_dialog_class_name;
         }
 
         void serialize_object(utils::buffer_serializer& buffer) const override
@@ -118,8 +125,15 @@ namespace sogen
             buffer.write(this->y);
             buffer.write(this->ex_style);
             buffer.write(this->style);
+            buffer.write(this->update_rect);
+            buffer.write(this->update_pending);
+            buffer.write(this->paint_message_posted);
+            buffer.write(this->erase_pending);
             buffer.write_map(this->props);
             buffer.write(this->wnd_proc);
+            buffer.write(this->system_menu_ptr);
+            buffer.write(this->host_surface_window);
+            buffer.write(this->unicode_proc);
         }
 
         void deserialize_object(utils::buffer_deserializer& buffer) override
@@ -137,8 +151,15 @@ namespace sogen
             buffer.read(this->y);
             buffer.read(this->ex_style);
             buffer.read(this->style);
+            buffer.read(this->update_rect);
+            buffer.read(this->update_pending);
+            buffer.read(this->paint_message_posted);
+            buffer.read(this->erase_pending);
             buffer.read_map(this->props);
             buffer.read(this->wnd_proc);
+            buffer.read(this->system_menu_ptr);
+            buffer.read(this->host_surface_window);
+            buffer.read(this->unicode_proc);
         }
     };
 
@@ -164,24 +185,32 @@ namespace sogen
     {
         uint32_t locked_count{0};
         uint32_t owning_thread_id{};
+        bool abandoned{false};
         std::u16string name{};
 
-        bool try_lock(const uint32_t thread_id)
+        bool is_signaled(const uint32_t thread_id) const
+        {
+            return this->abandoned || this->locked_count == 0 || this->owning_thread_id == thread_id;
+        }
+
+        std::optional<bool> try_lock(const uint32_t thread_id)
         {
             if (this->locked_count == 0)
             {
                 ++this->locked_count;
                 this->owning_thread_id = thread_id;
-                return true;
+                const auto was_abandoned = this->abandoned;
+                this->abandoned = false;
+                return was_abandoned;
             }
 
             if (this->owning_thread_id != thread_id)
             {
-                return false;
+                return std::nullopt;
             }
 
             ++this->locked_count;
-            return true;
+            return false;
         }
 
         std::pair<uint32_t, bool> release(const uint32_t thread_id)
@@ -194,13 +223,30 @@ namespace sogen
             }
 
             --this->locked_count;
+            if (this->locked_count == 0)
+            {
+                this->owning_thread_id = 0;
+            }
             return {old_count, true};
+        }
+
+        void abandon()
+        {
+            if (this->locked_count == 0)
+            {
+                return;
+            }
+
+            this->locked_count = 0;
+            this->owning_thread_id = 0;
+            this->abandoned = true;
         }
 
         void serialize_object(utils::buffer_serializer& buffer) const override
         {
             buffer.write(this->locked_count);
             buffer.write(this->owning_thread_id);
+            buffer.write(this->abandoned);
             buffer.write(this->name);
         }
 
@@ -208,6 +254,7 @@ namespace sogen
         {
             buffer.read(this->locked_count);
             buffer.read(this->owning_thread_id);
+            buffer.read(this->abandoned);
             buffer.read(this->name);
         }
     };
