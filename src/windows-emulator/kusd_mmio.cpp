@@ -80,6 +80,7 @@ namespace sogen
             kusd.QpcData.QpcBypassEnabled = 0x83;
             kusd.QpcBias = 0x000000159530c4af;
             kusd.QpcFrequency = utils::clock::steady_duration::period::den;
+            kusd.SystemCall = 1;
             kusd.Reserved1 = 0x7ffeffff;
             kusd.Reserved3 = 0x80000000;
             kusd.ProcessorFeatures.arr[PF_RDTSC_INSTRUCTION_AVAILABLE] = 1;

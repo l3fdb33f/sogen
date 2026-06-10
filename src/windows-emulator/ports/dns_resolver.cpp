@@ -157,6 +157,17 @@ namespace sogen
                 return std::memcmp(b.data.data(), a.data.data(), k_dns_record_data_size) < 0;
             });
 
+            if (records.empty() && dns_type == DNS_TYPE_A)
+            {
+                resolved_dns_record record{};
+                record.name = host;
+                record.type = DNS_TYPE_A;
+                record.data_length = 4;
+                const uint32_t loopback = 0x0100007F; // 127.0.0.1
+                memcpy(record.data.data(), &loopback, sizeof(loopback));
+                records.push_back(std::move(record));
+            }
+
             return records;
         }
 

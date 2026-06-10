@@ -41,6 +41,16 @@ namespace sogen
         map_syscalls(this->handlers_, ntdll_syscalls);
         map_syscalls(this->handlers_, win32u_syscalls);
 
+        // RtlWaitOnAddress uses these syscall ids but they are not exported as Nt* from ntdll.
+        for (const auto& [id, name] : std::map<uint64_t, std::string>{
+                 {0x16d, "NtWaitOnAddress"},
+                 {0x16e, "NtWakeByAddressSingle"},
+             })
+        {
+            auto& entry = this->handlers_[id];
+            entry.name = name;
+        }
+
         this->add_handlers();
         this->add_callbacks();
     }
@@ -63,6 +73,15 @@ namespace sogen
 #ifndef NDEBUG
             handler_mapping.erase(handler);
 #endif
+        }
+
+        for (const auto& [id, handler] :
+             std::map<uint64_t, syscall_handler>{{0x16d, make_syscall_handler<syscalls::handle_NtWaitOnAddress>()},
+                                                 {0x16e, make_syscall_handler<syscalls::handle_NtWakeByAddressSingle>()}})
+        {
+            auto& entry = this->handlers_[id];
+            entry.name = (id == 0x16d) ? "NtWaitOnAddress" : "NtWakeByAddressSingle";
+            entry.handler = handler;
         }
     }
 

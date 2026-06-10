@@ -4,6 +4,7 @@
 #include "../syscall_utils.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <utils/finally.hpp>
 
 namespace sogen
@@ -562,6 +563,97 @@ namespace sogen
 
             c.win_emu.yield_thread();
 
+            return STATUS_SUCCESS;
+        }
+
+        namespace
+        {
+            bool read_address_value(const memory_interface& memory, const uint64_t address, const size_t size, uint64_t& value)
+            {
+                if (address == 0 || size == 0 || size > 8)
+                {
+                    return false;
+                }
+
+                std::array<std::byte, 8> buffer{};
+                if (!memory.try_read_memory(address, buffer.data(), size))
+                {
+                    return false;
+                }
+
+                value = 0;
+                memcpy(&value, buffer.data(), size);
+                return true;
+            }
+
+            bool write_address_value(memory_interface& memory, const uint64_t address, const size_t size, const uint64_t value)
+            {
+                if (address == 0 || size == 0 || size > 8)
+                {
+                    return false;
+                }
+
+                std::array<std::byte, 8> buffer{};
+                memcpy(buffer.data(), &value, size);
+                return memory.try_write_memory(address, buffer.data(), size);
+            }
+
+            bool address_values_match(const uint64_t left, const uint64_t right, const size_t size)
+            {
+                const auto mask = size >= 8 ? ~0ull : ((1ull << (size * 8)) - 1);
+                return (left & mask) == (right & mask);
+            }
+        }
+
+        NTSTATUS handle_NtWaitOnAddress(const syscall_context& c, const uint64_t address, const uint64_t compare_address,
+                                        const uint64_t size, const emulator_object<LARGE_INTEGER> timeout)
+        {
+            (void)timeout;
+            if (address == 0)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            const auto size_bytes = size == 0 ? sizeof(uint32_t) : static_cast<size_t>(std::min<uint64_t>(size, 8));
+            auto& memory = c.win_emu.memory;
+
+            uint64_t address_value{};
+            if (!read_address_value(memory, address, size_bytes, address_value))
+            {
+                return STATUS_SUCCESS;
+            }
+
+            uint64_t compare_value = address_value;
+            if (compare_address != 0 &&
+                !read_address_value(memory, compare_address, size_bytes, compare_value))
+            {
+                return STATUS_SUCCESS;
+            }
+
+            if (address_values_match(address_value, compare_value, size_bytes))
+            {
+                const auto mask = size_bytes >= 8 ? ~0ull : ((1ull << (size_bytes * 8)) - 1);
+                (void)write_address_value(memory, address, size_bytes, (address_value + 1) & mask);
+            }
+
+            return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtWakeByAddressSingle(const syscall_context& c, const uint64_t address)
+        {
+            if (address == 0)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            auto& memory = c.win_emu.memory;
+            uint64_t value{};
+            if (!read_address_value(memory, address, sizeof(uint32_t), value))
+            {
+                return STATUS_SUCCESS;
+            }
+
+            (void)write_address_value(memory, address, sizeof(uint32_t), value + 1);
             return STATUS_SUCCESS;
         }
 

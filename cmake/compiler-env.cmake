@@ -1,5 +1,8 @@
 include_guard()
 include(CheckCXXCompilerFlag)
+include(CheckCCompilerFlag)
+
+check_c_compiler_flag(-ftrivial-auto-var-init=zero COMPILER_SUPPORTS_TRIVIAL_AUTO_VAR_INIT)
 
 ##########################################
 # System identification
@@ -63,8 +66,12 @@ endif()
 if(UNIX)
   sogen_add_c_and_cxx_compile_options(
     -fvisibility=hidden
-    -ftrivial-auto-var-init=zero
   )
+  if(COMPILER_SUPPORTS_TRIVIAL_AUTO_VAR_INIT)
+    momo_add_c_and_cxx_compile_options(
+      -ftrivial-auto-var-init=zero
+    )
+  endif()
 endif()
 
 ##########################################
@@ -131,9 +138,13 @@ endif()
 if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
   sogen_add_c_and_cxx_compile_options(
     -fexceptions
-    -ftrivial-auto-var-init=zero
     -Wno-dollar-in-identifier-extension
   )
+  if(COMPILER_SUPPORTS_TRIVIAL_AUTO_VAR_INIT)
+    momo_add_c_and_cxx_compile_options(
+      -ftrivial-auto-var-init=zero
+    )
+  endif()
 
   add_link_options(
     -fexceptions
